@@ -43,7 +43,7 @@ app.conf.update(
             'schedule': 1800.0,  # Run every 30 minutes
         },
         'process-dirty-cache-flags': {
-            'task': 'apps.availability.tasks.process_dirty_cache_flags',
+            'task': 'availability.tasks.process_dirty_cache_flags',
             'schedule': 300.0,  # Run every 5 minutes
         },
         'monitor-cache-performance-detailed': {

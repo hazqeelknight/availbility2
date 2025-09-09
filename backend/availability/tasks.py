@@ -4,11 +4,185 @@ from django.utils import timezone
 from django.conf import settings
 from datetime import datetime, timedelta
 from .utils import calculate_available_slots, get_cache_key_for_availability, get_weekly_cache_keys_for_date_range, generate_cache_key_variations
+from .models import EventTypeAvailabilityCache
 from apps.users.models import User
 from apps.events.models import EventType
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+@shared_task
+def process_dirty_cache_flags():
+    """
+    Process dirty cache flags in batches for efficient cache invalidation.
+    This task runs periodically to handle cache invalidation without blocking user requests.
+    """
+    try:
+        # Get all dirty cache entries
+        dirty_entries = EventTypeAvailabilityCache.objects.filter(is_dirty=True).select_related(
+            'organizer', 'event_type'
+        )[:100]  # Process in batches of 100
+        
+        if not dirty_entries:
+            logger.debug("No dirty cache entries to process")
+            return "No dirty cache entries found"
+        
+        processed_count = 0
+        errors_count = 0
+        
+        # Group entries by organizer and event type for efficient processing
+        grouped_entries = {}
+        for entry in dirty_entries:
+            key = (entry.organizer.id, entry.event_type.id)
+            if key not in grouped_entries:
+                grouped_entries[key] = []
+            grouped_entries[key].append(entry)
+        
+        for (organizer_id, event_type_id), entries in grouped_entries.items():
+            try:
+                # Get date range for this group
+                dates = [entry.date for entry in entries]
+                start_date = min(dates)
+                end_date = max(dates)
+                
+                # Clear cache for this specific organizer/event type/date range
+                clear_availability_cache_specific.delay(
+                    organizer_id=organizer_id,
+                    event_type_id=event_type_id,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat()
+                )
+                
+                # Mark entries as clean
+                entry_ids = [entry.id for entry in entries]
+                EventTypeAvailabilityCache.objects.filter(id__in=entry_ids).update(is_dirty=False)
+                
+                processed_count += len(entries)
+                
+            except Exception as e:
+                logger.error(f"Error processing dirty cache entries for organizer {organizer_id}, event type {event_type_id}: {str(e)}")
+                errors_count += 1
+        
+        logger.info(f"Processed {processed_count} dirty cache entries with {errors_count} errors")
+        return f"Processed {processed_count} entries, {errors_count} errors"
+        
+    except Exception as e:
+        logger.error(f"Error in process_dirty_cache_flags: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+@shared_task
+def clear_availability_cache_specific(organizer_id, event_type_id, start_date, end_date):
+    """
+    Clear cache for a specific organizer, event type, and date range.
+    
+    Args:
+        organizer_id: UUID of the organizer
+        event_type_id: UUID of the event type
+        start_date: Start date (ISO format string)
+        end_date: End date (ISO format string)
+    """
+    try:
+        organizer = User.objects.get(id=organizer_id)
+        event_type = EventType.objects.get(id=event_type_id)
+        
+        start_date_obj = datetime.fromisoformat(start_date).date()
+        end_date_obj = datetime.fromisoformat(end_date).date()
+        
+        # Generate cache keys for this specific range
+        cache_keys_to_clear = []
+        
+        # Common timezone variations and attendee counts
+        common_timezones = ['UTC', 'America/New_York', 'Europe/London', 'Asia/Tokyo', 'America/Los_Angeles']
+        attendee_counts = [1, 2, 3, 4, 5]
+        
+        current_date = start_date_obj
+        while current_date <= end_date_obj:
+            for tz in common_timezones:
+                for count in attendee_counts:
+                    cache_key = get_cache_key_for_availability(
+                        organizer_id, event_type_id, current_date, current_date, tz, count
+                    )
+                    cache_keys_to_clear.append(cache_key)
+            current_date += timedelta(days=1)
+        
+        # Clear the cache keys
+        if cache_keys_to_clear:
+            cache.delete_many(cache_keys_to_clear)
+            logger.info(f"Cleared {len(cache_keys_to_clear)} cache keys for {organizer.email}/{event_type.name}")
+        
+        # Precompute fresh cache for this range
+        precompute_availability_cache_specific.delay(
+            organizer_id=organizer_id,
+            event_type_id=event_type_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        return f"Cleared cache for {organizer.email}/{event_type.name} from {start_date} to {end_date}"
+        
+    except Exception as e:
+        logger.error(f"Error clearing specific cache: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+@shared_task
+def precompute_availability_cache_specific(organizer_id, event_type_id, start_date, end_date):
+    """
+    Precompute cache for a specific organizer, event type, and date range.
+    
+    Args:
+        organizer_id: UUID of the organizer
+        event_type_id: UUID of the event type
+        start_date: Start date (ISO format string)
+        end_date: End date (ISO format string)
+    """
+    try:
+        organizer = User.objects.get(id=organizer_id)
+        event_type = EventType.objects.get(id=event_type_id)
+        
+        start_date_obj = datetime.fromisoformat(start_date).date()
+        end_date_obj = datetime.fromisoformat(end_date).date()
+        
+        # Precompute for common scenarios
+        common_timezones = ['UTC', 'America/New_York', 'Europe/London']
+        attendee_counts = [1, 2]
+        
+        cached_count = 0
+        
+        for tz in common_timezones:
+            for count in attendee_counts:
+                try:
+                    # Calculate available slots
+                    available_slots = calculate_available_slots(
+                        organizer=organizer,
+                        event_type=event_type,
+                        start_date=start_date_obj,
+                        end_date=end_date_obj,
+                        invitee_timezone=tz,
+                        attendee_count=count
+                    )
+                    
+                    # Create cache key
+                    cache_key = get_cache_key_for_availability(
+                        organizer_id, event_type_id, start_date_obj, end_date_obj, tz, count
+                    )
+                    
+                    # Cache for 1 hour
+                    cache.set(cache_key, available_slots, timeout=3600)
+                    cached_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error precomputing for {tz}/{count}: {str(e)}")
+                    continue
+        
+        logger.info(f"Precomputed {cached_count} cache entries for {organizer.email}/{event_type.name}")
+        return f"Precomputed {cached_count} entries"
+        
+    except Exception as e:
+        logger.error(f"Error precomputing specific cache: {str(e)}")
+        return f"Error: {str(e)}"
 
 
 @shared_task
