@@ -3,6 +3,7 @@ from django.dispatch import receiver
 from django.utils import timezone
 from .models import AvailabilityRule, BlockedTime, BufferTime, DateOverrideRule, RecurringBlockedTime
 from apps.events.models import EventType
+from .utils import mark_cache_dirty
 import logging
 
 logger = logging.getLogger(__name__)
@@ -11,12 +12,24 @@ logger = logging.getLogger(__name__)
 @receiver(post_save, sender=AvailabilityRule)
 @receiver(post_delete, sender=AvailabilityRule)
 def invalidate_cache_on_availability_rule_change(sender, instance, **kwargs):
-    """Invalidate cache when availability rules change."""
-    from .tasks import clear_availability_cache
+    """Mark cache as dirty when availability rules change."""
     
-    logger.info(f"Availability rule changed for {instance.organizer.email}, clearing cache")
-    clear_availability_cache.delay(
-        instance.organizer.id, 
+    logger.info(f"Availability rule changed for {instance.organizer.email}, marking cache dirty")
+    
+    # Determine affected event types
+    event_type_ids = None
+    if instance.event_types.exists():
+        event_type_ids = list(instance.event_types.values_list('id', flat=True))
+    
+    # Mark cache dirty for future dates (rules affect ongoing availability)
+    start_date = timezone.now().date()
+    end_date = start_date + timezone.timedelta(days=90)
+    
+    mark_cache_dirty(
+        organizer_id=instance.organizer.id,
+        event_type_ids=event_type_ids,
+        start_date=start_date,
+        end_date=end_date,
         cache_type='availability_rule_change',
         day_of_week=instance.day_of_week
     )
@@ -25,56 +38,78 @@ def invalidate_cache_on_availability_rule_change(sender, instance, **kwargs):
 @receiver(post_save, sender=DateOverrideRule)
 @receiver(post_delete, sender=DateOverrideRule)
 def invalidate_cache_on_date_override_change(sender, instance, **kwargs):
-    """Invalidate cache when date override rules change."""
-    from .tasks import clear_availability_cache
+    """Mark cache as dirty when date override rules change."""
     
-    logger.info(f"Date override changed for {instance.organizer.email} on {instance.date}, clearing cache")
-    clear_availability_cache.delay(
-        instance.organizer.id,
+    logger.info(f"Date override changed for {instance.organizer.email} on {instance.date}, marking cache dirty")
+    
+    # Determine affected event types
+    event_type_ids = None
+    if instance.event_types.exists():
+        event_type_ids = list(instance.event_types.values_list('id', flat=True))
+    
+    mark_cache_dirty(
+        organizer_id=instance.organizer.id,
+        event_type_ids=event_type_ids,
+        start_date=instance.date,
+        end_date=instance.date,
         cache_type='date_override_change',
-        affected_date=instance.date.isoformat()
+        affected_date=instance.date
     )
 
 
 @receiver(post_save, sender=RecurringBlockedTime)
 @receiver(post_delete, sender=RecurringBlockedTime)
 def invalidate_cache_on_recurring_block_change(sender, instance, **kwargs):
-    """Invalidate cache when recurring blocked times change."""
-    from .tasks import clear_availability_cache
+    """Mark cache as dirty when recurring blocked times change."""
     
-    logger.info(f"Recurring block changed for {instance.organizer.email}, clearing cache")
-    clear_availability_cache.delay(
-        instance.organizer.id,
+    logger.info(f"Recurring block changed for {instance.organizer.email}, marking cache dirty")
+    
+    # Calculate affected date range
+    start_date = instance.start_date or timezone.now().date()
+    end_date = instance.end_date or (timezone.now().date() + timezone.timedelta(days=90))
+    
+    mark_cache_dirty(
+        organizer_id=instance.organizer.id,
+        start_date=start_date,
+        end_date=end_date,
         cache_type='recurring_block_change',
         day_of_week=instance.day_of_week,
-        start_date=instance.start_date.isoformat() if instance.start_date else None,
-        end_date=instance.end_date.isoformat() if instance.end_date else None
+        block_start_date=instance.start_date,
+        block_end_date=instance.end_date
     )
 
 
 @receiver(post_save, sender=BlockedTime)
 @receiver(post_delete, sender=BlockedTime)
 def invalidate_cache_on_blocked_time_change(sender, instance, **kwargs):
-    """Invalidate cache when blocked times change."""
-    from .tasks import clear_availability_cache
+    """Mark cache as dirty when blocked times change."""
     
-    logger.info(f"Blocked time changed for {instance.organizer.email}, clearing cache")
-    clear_availability_cache.delay(
-        instance.organizer.id,
+    logger.info(f"Blocked time changed for {instance.organizer.email}, marking cache dirty")
+    
+    mark_cache_dirty(
+        organizer_id=instance.organizer.id,
+        start_date=instance.start_datetime.date(),
+        end_date=instance.end_datetime.date(),
         cache_type='blocked_time_change',
-        start_date=instance.start_datetime.date().isoformat(),
-        end_date=instance.end_datetime.date().isoformat()
+        blocked_start=instance.start_datetime,
+        blocked_end=instance.end_datetime
     )
 
 
 @receiver(post_save, sender=BufferTime)
 def invalidate_cache_on_buffer_time_change(sender, instance, **kwargs):
-    """Invalidate cache when buffer time settings change."""
-    from .tasks import clear_availability_cache
+    """Mark cache as dirty when buffer time settings change."""
     
-    logger.info(f"Buffer time settings changed for {instance.organizer.email}, clearing cache")
-    clear_availability_cache.delay(
-        instance.organizer.id,
+    logger.info(f"Buffer time settings changed for {instance.organizer.email}, marking cache dirty")
+    
+    # Buffer changes affect all future availability
+    start_date = timezone.now().date()
+    end_date = start_date + timezone.timedelta(days=90)
+    
+    mark_cache_dirty(
+        organizer_id=instance.organizer.id,
+        start_date=start_date,
+        end_date=end_date,
         cache_type='buffer_time_change'
     )
 
@@ -112,9 +147,8 @@ def track_event_type_changes(sender, instance, **kwargs):
 
 @receiver(post_save, sender=EventType)
 def invalidate_cache_on_event_type_change(sender, instance, **kwargs):
-    """Invalidate cache when event type availability settings change."""
+    """Mark cache as dirty when event type availability settings change."""
     if hasattr(instance, '_availability_fields_changed'):
-        from .tasks import clear_availability_cache
         
         changed_fields = instance._availability_fields_changed
         previous_values = getattr(instance, '_previous_values', {})
@@ -122,11 +156,17 @@ def invalidate_cache_on_event_type_change(sender, instance, **kwargs):
         logger.info(f"Event type {instance.name} changed availability-affecting fields: {changed_fields}")
         logger.debug(f"Previous values: {previous_values}")
         
-        # EventType changes affect all future availability for that type, so immediate refresh
-        clear_availability_cache.delay(
-            instance.organizer.id,
+        # EventType changes affect all future availability for that specific type
+        start_date = timezone.now().date()
+        end_date = start_date + timezone.timedelta(days=90)
+        
+        mark_cache_dirty(
+            organizer_id=instance.organizer.id,
+            event_type_ids=[instance.id],
+            start_date=start_date,
+            end_date=end_date,
             cache_type='event_type_change',
-            event_type_id=str(instance.id),
+            event_type_id=instance.id,
             changed_fields=changed_fields,
             previous_values=previous_values
         )

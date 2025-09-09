@@ -4,6 +4,33 @@ from datetime import time
 import uuid
 
 
+class EventTypeAvailabilityCache(models.Model):
+    """
+    Granular cache tracking for availability calculations.
+    Tracks which specific daily availability caches for event types are stale.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organizer = models.ForeignKey('users.User', on_delete=models.CASCADE, related_name='availability_cache_entries')
+    event_type = models.ForeignKey('events.EventType', on_delete=models.CASCADE, related_name='availability_cache_entries')
+    date = models.DateField(help_text="Date for which the cache is tracked")
+    is_dirty = models.BooleanField(default=True, help_text="Whether the cache for this date/event type is stale")
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'event_type_availability_cache'
+        verbose_name = 'Event Type Availability Cache'
+        verbose_name_plural = 'Event Type Availability Cache Entries'
+        unique_together = ['organizer', 'event_type', 'date']
+        indexes = [
+            models.Index(fields=['organizer', 'is_dirty']),
+            models.Index(fields=['event_type', 'date', 'is_dirty']),
+        ]
+    
+    def __str__(self):
+        status = "DIRTY" if self.is_dirty else "CLEAN"
+        return f"{self.organizer.email} - {self.event_type.name} - {self.date} ({status})"
 class AvailabilityRule(models.Model):
     """Recurring availability rules for organizers."""
     WEEKDAY_CHOICES = [

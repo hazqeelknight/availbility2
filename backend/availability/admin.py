@@ -1,7 +1,36 @@
 from django.contrib import admin
-from .models import AvailabilityRule, BlockedTime, BufferTime, DateOverrideRule, RecurringBlockedTime
+from .models import AvailabilityRule, BlockedTime, BufferTime, DateOverrideRule, RecurringBlockedTime, EventTypeAvailabilityCache
 
 
+@admin.register(EventTypeAvailabilityCache)
+class EventTypeAvailabilityCacheAdmin(admin.ModelAdmin):
+    list_display = ('organizer', 'event_type', 'date', 'is_dirty', 'created_at', 'updated_at')
+    list_filter = ('is_dirty', 'date', 'created_at')
+    search_fields = ('organizer__email', 'event_type__name')
+    readonly_fields = ('created_at', 'updated_at')
+    date_hierarchy = 'date'
+    
+    fieldsets = (
+        ('Cache Entry', {
+            'fields': ('organizer', 'event_type', 'date', 'is_dirty')
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    actions = ['mark_as_dirty', 'mark_as_clean']
+    
+    def mark_as_dirty(self, request, queryset):
+        updated = queryset.update(is_dirty=True)
+        self.message_user(request, f'{updated} cache entries marked as dirty.')
+    mark_as_dirty.short_description = 'Mark selected entries as dirty'
+    
+    def mark_as_clean(self, request, queryset):
+        updated = queryset.update(is_dirty=False)
+        self.message_user(request, f'{updated} cache entries marked as clean.')
+    mark_as_clean.short_description = 'Mark selected entries as clean'
 @admin.register(AvailabilityRule)
 class AvailabilityRuleAdmin(admin.ModelAdmin):
     list_display = ('organizer', 'day_of_week', 'start_time', 'end_time', 'spans_midnight', 'event_types_count', 'is_active')

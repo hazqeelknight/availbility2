@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, time
 from django.utils import timezone
 from django.db import models
 from zoneinfo import ZoneInfo
-from .models import AvailabilityRule, BlockedTime, BufferTime, DateOverrideRule, RecurringBlockedTime
+from .models import AvailabilityRule, BlockedTime, BufferTime, DateOverrideRule, RecurringBlockedTime, EventTypeAvailabilityCache
 from apps.events.models import Booking, EventTypeAvailabilityCache
 import logging
 import time as time_module
@@ -11,6 +11,65 @@ from django.core.cache import cache
 logger = logging.getLogger(__name__)
 
 
+def mark_cache_dirty(organizer_id, event_type_ids=None, start_date=None, end_date=None, cache_type=None, **kwargs):
+    """
+    Mark cache entries as dirty for batch processing.
+    
+    Args:
+        organizer_id: UUID of the organizer
+        event_type_ids: List of event type IDs (if None, affects all event types)
+        start_date: Start date for the affected range
+        end_date: End date for the affected range
+        cache_type: Type of change that triggered the dirty flag
+        **kwargs: Additional parameters for specific cache types
+    """
+    from apps.events.models import EventType
+    
+    try:
+        # Get organizer
+        from apps.users.models import User
+        organizer = User.objects.get(id=organizer_id)
+        
+        # Determine affected event types
+        if event_type_ids:
+            event_types = EventType.objects.filter(id__in=event_type_ids, organizer=organizer, is_active=True)
+        else:
+            event_types = EventType.objects.filter(organizer=organizer, is_active=True)
+        
+        # Determine affected date range
+        if not start_date:
+            start_date = timezone.now().date()
+        if not end_date:
+            # Default to 90 days ahead for most changes
+            end_date = start_date + timedelta(days=90)
+        
+        # Create or update cache entries
+        entries_created = 0
+        entries_updated = 0
+        
+        current_date = start_date
+        while current_date <= end_date:
+            for event_type in event_types:
+                cache_entry, created = EventTypeAvailabilityCache.objects.get_or_create(
+                    organizer=organizer,
+                    event_type=event_type,
+                    date=current_date,
+                    defaults={'is_dirty': True}
+                )
+                
+                if created:
+                    entries_created += 1
+                elif not cache_entry.is_dirty:
+                    cache_entry.is_dirty = True
+                    cache_entry.save(update_fields=['is_dirty', 'updated_at'])
+                    entries_updated += 1
+            
+            current_date += timedelta(days=1)
+        
+        logger.info(f"Cache dirty marking for {organizer.email}: {entries_created} created, {entries_updated} updated (type: {cache_type})")
+        
+    except Exception as e:
+        logger.error(f"Error marking cache dirty for organizer {organizer_id}: {str(e)}")
 def get_external_busy_times(organizer, start_date, end_date):
     """
     Get busy times from external calendar integrations.
@@ -292,9 +351,32 @@ def calculate_available_slots(organizer, event_type, start_date, end_date, invit
 
 
 def _is_cache_dirty(organizer, start_date, end_date):
-    """Check if cache is dirty for the given date range."""
-    # Check if any cache entries are marked as dirty
-    dirty_entries = EventTypeAvailabilityCache.objects.filter(
+    """
+    Check if cache is dirty for the given date range.
+    
+    Args:
+        organizer: User instance
+        start_date: Start date to check
+        end_date: End date to check
+        
+    Returns:
+        bool: True if any cache entries are dirty in the date range
+    """
+    try:
+        # Check if any cache entries are marked as dirty for this organizer and date range
+        dirty_entries = EventTypeAvailabilityCache.objects.filter(
+            organizer=organizer,
+            date__gte=start_date,
+            date__lte=end_date,
+            is_dirty=True
+        ).exists()
+        
+        return dirty_entries
+        
+    except Exception as e:
+        logger.error(f"Error checking cache dirty status: {str(e)}")
+        # If we can't check, assume it's dirty to be safe
+        return True
         organizer=organizer,
         date__gte=start_date,
         date__lte=end_date,
@@ -699,57 +781,80 @@ def calculate_dst_safe_time_slots(organizer_timezone, invitee_timezone, base_slo
     """
     Ensure time slots are correctly calculated across DST transitions.
     
+    Instead of discarding slots that cross DST boundaries, this function
+    adjusts them to ensure valid local times are presented.
+    
     Args:
         organizer_timezone: Organizer's IANA timezone
         invitee_timezone: Invitee's IANA timezone
         base_slots: List of slot dictionaries
     
     Returns:
-        list: DST-safe slots with corrected times
+        list: DST-adjusted slots with valid local times
     """
     try:
         org_tz = ZoneInfo(organizer_timezone)
         invitee_tz = ZoneInfo(invitee_timezone)
         
-        dst_safe_slots = []
+        adjusted_slots = []
         
         for slot in base_slots:
             start_time = slot['start_time']
             end_time = slot['end_time']
             
-            # Check if this slot crosses a DST boundary
+            # Convert to invitee timezone
+            local_start = start_time.astimezone(invitee_tz)
+            local_end = end_time.astimezone(invitee_tz)
+            
+            # Check for DST transition issues
             start_local_org = start_time.astimezone(org_tz)
             end_local_org = end_time.astimezone(org_tz)
             
-            # Check for DST transition
             start_dst = start_local_org.dst()
             end_dst = end_local_org.dst()
             
+            # If slot crosses DST boundary, adjust it instead of discarding
             if start_dst != end_dst:
-                # DST transition during this slot - log warning
-                logger.warning(f"DST transition during slot {start_time} - {end_time}")
+                logger.info(f"DST transition detected for slot {start_time} - {end_time}, adjusting...")
                 
-                # For now, skip slots that cross DST boundaries to avoid confusion
-                continue
+                # Adjust the slot to avoid invalid local times
+                # For spring forward: if local time falls in skipped hour, move to next valid hour
+                # For fall back: slots should be valid, but we may need to clarify which occurrence
+                
+                # Check if local start time is in a skipped hour (spring forward)
+                try:
+                    # Try to create a datetime in the invitee's timezone at the local time
+                    test_local = local_start.replace(tzinfo=None)
+                    invitee_tz.localize(test_local)
+                except:
+                    # If localization fails, the time is in a skipped hour
+                    # Adjust by moving forward to the next valid hour
+                    adjustment = timedelta(hours=1)
+                    start_time = start_time + adjustment
+                    end_time = end_time + adjustment
+                    local_start = start_time.astimezone(invitee_tz)
+                    local_end = end_time.astimezone(invitee_tz)
+                    logger.info(f"Adjusted slot to avoid skipped hour: {local_start} - {local_end}")
             
-            # Convert to invitee timezone
             slot_copy = slot.copy()
-            slot_copy['local_start_time'] = start_time.astimezone(invitee_tz)
-            slot_copy['local_end_time'] = end_time.astimezone(invitee_tz)
+            slot_copy['start_time'] = start_time
+            slot_copy['end_time'] = end_time
+            slot_copy['local_start_time'] = local_start
+            slot_copy['local_end_time'] = local_end
             
             # Add DST information for debugging
             slot_copy['dst_info'] = {
                 'organizer_dst': bool(start_dst),
-                'invitee_dst': bool(start_time.astimezone(invitee_tz).dst()),
+                'invitee_dst': bool(local_start.dst()),
                 'dst_transition': start_dst != end_dst
             }
             
-            dst_safe_slots.append(slot_copy)
+            adjusted_slots.append(slot_copy)
         
-        return dst_safe_slots
+        return adjusted_slots
         
     except Exception as e:
-        logger.error(f"Error calculating DST-safe slots: {str(e)}")
+        logger.error(f"Error adjusting DST slots: {str(e)}")
         return base_slots  # Return original slots if DST calculation fails
 
 
